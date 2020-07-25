@@ -1,0 +1,258 @@
+<?php
+defined('MOODLE_INTERNAL') || die();
+
+require_once($CFG->libdir . "/externallib.php");
+require_once($CFG->libdir.'/authlib.php');
+require_once($CFG->dirroot . '/user/lib.php');
+require_once($CFG->dirroot.'/user/profile/lib.php'); 
+
+/**
+ * AHEA User authentication plugin.
+ */
+class auth_plugin_sentry extends auth_plugin_base  {
+
+    public function pre_loginpage_hook() {
+
+        $this->log(__FUNCTION__ . ' enter');
+        $this->loginpage_hook();
+        $this->log(__FUNCTION__ . ' exit');
+    }
+
+    /**
+     * A debug function, dumps to the php log
+     *
+     */
+    private function log($msg) {
+        error_log('auth_sentry: ' . $msg);
+    }
+
+    /**
+      * Method to process login call from Master Application.
+      * Parameters: None
+      * returns None 
+      */
+    public function loginpage_hook() {
+
+        global $CFG, $DB, $USER, $SESSION;
+        print print_string("Test", "auth_sentry");
+        // If user param is present then its an SSO call else direct login call to moodle.
+        if (isset($_GET["user"])){
+            
+            $user_token = $_GET["user"];
+            print print_string($user_token, "auth_sentry");
+            $user_detail = $this->get_user_details($user_token);
+            $username = $user_detail->institutionEmail;
+    
+            $user = $DB->get_record('user', array('username' => $username, 'deleted' => 0, 'mnethostid' => $CFG->mnet_localhost_id));
+            if($user){
+                $user->id = $user->id;
+                
+                profile_save_data($this->set_profile_details($user, $user_detail));
+                user_update_user($user);       
+                complete_user_login($user);
+                $this->set_cookie_and_redirect($username); 
+            } else{                
+                $new_user = $this->create_user($user_detail);
+                complete_user_login($new_user);
+                $this->set_cookie_and_redirect($username);                
+            }
+        } elseif (isset($_GET["updateuser"])){
+            $user_token = $_GET["updateuser"];
+            $user_detail = $this->get_user_details($user_token);
+            
+            print_r($user_detail);
+            $username = $user_detail->institutionEmail;
+    
+            $user = $DB->get_record('user', array('username' => $username, 'deleted' => 0, 'mnethostid' => $CFG->mnet_localhost_id));
+            if($user){
+                $user->id = $user->id;
+                profile_save_data($this->set_profile_details($user, $user_detail));
+                user_update_user($user);       
+            } else{                
+                $new_user = $this->create_user($user_detail);           
+            }
+        }
+        
+    }
+
+    /**
+      * Method to get a user details using API call from Master Application.
+      * Parameters:
+      * $user_token : token id obtained in initial login call from master application 
+      * returns $user_detail, stdClass Object of the user 
+      */
+    public function get_user_details($user_token){
+        $opts = [
+            "http" => [
+                    "method" => "GET"
+                    ]
+                ];
+        
+        $context = stream_context_create($opts);
+        $master_url = 'http://23.99.141.44:3000/getUserDetails?user=';
+        $user_response = file_get_contents($master_url.$user_token, false, $context);
+
+        $user_response = json_decode($user_response);
+        $user_detail = $user_response->user;
+
+        return $user_detail;
+    }
+
+    /**
+      * Method to create a user in moodle with details obtained from API call.
+      * Mark the user as confirmed so the user does not need to confirm using email.
+      * Parameters:
+      * $user_detail : stdClass object 
+      * returns $new_user, stdClass Object of the newly created user 
+      */
+    public function create_user($user_detail) {
+        global $DB, $CFG;        
+
+        unset($user['ip']);
+        $user['confirmed'] = 1;
+        $user['mnethostid'] = $CFG->mnet_localhost_id;
+        $user['username'] = $user_detail->institutionEmail;
+        $user['email'] = $user_detail->institutionEmail;
+        $user['firstname'] = $user_detail->firstName;
+        $user['lastname'] = $user_detail->lastName;
+        $user['password'] = $user_detail->firstName.'*Moodle12';
+
+        $requiredfieds = ['username', 'email', 'firstname', 'lastname'];
+        $missingfields = [];
+        foreach ($requiredfieds as $requiredfied) {
+            if (empty($user[$requiredfied])) {
+                $missingfields[] = $requiredfied;
+            }
+        }
+        if (!empty($missingfields)) {
+            throw new invalid_parameter_exception('Unable to create user, missing value(s): ' . implode(',', $missingfields));
+        }
+
+        if ($DB->record_exists('user', array('username' => $user['username'], 'mnethostid' => $CFG->mnet_localhost_id))) {
+            throw new invalid_parameter_exception('Username already exists: '.$user['username']);
+        }
+        if (!validate_email($user['email'])) {
+            throw new invalid_parameter_exception('Email address is invalid: '.$user['email']);
+        } else if (empty($CFG->allowaccountssameemail) &&
+            $DB->record_exists('user', array('email' => $user['email'], 'mnethostid' => $user['mnethostid']))) {
+            throw new invalid_parameter_exception('Email address already exists: '.$user['email']);
+        }
+
+        $userid = user_create_user($user);
+        $new_user = $DB->get_record('user', ['id' => $userid]);       
+        
+        profile_save_data($this->set_profile_details($new_user, $user_detail));
+        return $new_user;
+    }
+
+    
+    public function user_login($username, $password) {
+        return false;
+    }
+
+    public function set_profile_details($user, $user_detail) {
+        $user->firstname = $user_detail->firstName;
+        $user->lastname = $user_detail->lastName;
+                
+        $veteran = $user_detail->veteran;
+        if ($veteran == 0){
+            $user->profile_field_veteran = 'No';    
+        } else{
+            $user->profile_field_veteran = 'Yes';
+        }
+                
+        $ssn = $user_detail->ssn;
+        if(!is_null($ssn)){
+            $user->profile_field_ssn = $ssn;
+        } 
+
+        $institutionName = $user_detail->institutionName;
+        if(!is_null($institutionName)){
+            $user->profile_field_instName = $institutionName;
+        }
+
+        $phone = $user_detail->phone;
+        if(!is_null($phone)){
+            $user->profile_field_phone = $phone;
+        }
+
+        $ethnicity = $user_detail->ethnicity;
+        if(!is_null($ethnicity)){
+            $user->profile_field_ethnicity = $ethnicity;
+        } 
+
+        $dateOfBirth = $user_detail->dateOfBirth;
+        if(!is_null($dateOfBirth)){
+            $user->profile_field_dob = $dateOfBirth;
+        } 
+
+        $gender = $user_detail->gender;
+        if(!is_null($gender)){
+            $user->profile_field_gender = $gender;
+        } 
+
+        $emergencyContact = $user_detail->emergencyContact;
+        if(!is_null($emergencyContact)){
+            $user->profile_field_emergencyContact = $emergencyContact;
+        }
+                
+        $emergencyContactPhone = $user_detail->emergencyContactPhone;
+        if(!is_null($emergencyContactPhone)){
+            $user->profile_field_emergencyContactPhone = $emergencyContactPhone;
+        }
+
+        $address1 = $user_detail->address1;
+        if(!is_null($address1)){
+            $user->profile_field_address1 = $address1;
+        }
+
+        $address2 = $user_detail->address2;
+        if(!is_null($address2)){
+            $user->profile_field_address2 = $address2;
+        }
+
+        $state = $user_detail->state;
+        if(!is_null($state)){
+            $user->profile_field_state = $state;
+        }
+
+        $zip = $user_detail->zip;
+        if(!is_null($zip)){
+            $user->profile_field_zip = $zip;
+        }
+
+        $city = $user_detail->city;
+        if(!is_null($city)){
+            $user->city = $city;
+        }
+
+        $roles = $user_detail->roles;
+        if(!is_null($roles)){
+            $user->profile_field_roles = $roles;
+        }
+
+        $position = $user_detail->position;
+        if(!is_null($position)){
+            $user->profile_field_position = '';
+        }
+
+        return $user;
+    }
+
+    /**
+      * Method to set moodle cookie and redirect user to dashboard after successfull login.
+      * Parameters:
+      * $username : user name of the user 
+      * returns None 
+      */
+    public function set_cookie_and_redirect($username){
+        $USER->loggedin = true;
+        $USER->site = $CFG->wwwroot;
+        set_moodle_cookie($username);
+        $urltogo = $CFG->wwwroot.'/my';
+        redirect($urltogo);
+    }
+
+}
+
+?>
